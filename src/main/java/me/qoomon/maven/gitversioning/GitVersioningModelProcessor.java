@@ -1,34 +1,5 @@
 package me.qoomon.maven.gitversioning;
 
-import com.fasterxml.jackson.dataformat.xml.XmlMapper;
-import com.google.inject.Key;
-import com.google.inject.OutOfScopeException;
-import de.pdark.decentxml.Document;
-import de.pdark.decentxml.Element;
-import me.qoomon.gitversioning.commons.GitSituation;
-import me.qoomon.gitversioning.commons.GitUtil;
-import me.qoomon.maven.gitversioning.Configuration.PropertyDescription;
-import me.qoomon.maven.gitversioning.Configuration.VersionDescription;
-import org.apache.maven.artifact.versioning.DefaultArtifactVersion;
-import org.apache.maven.building.Source;
-import org.apache.maven.execution.MavenSession;
-import org.apache.maven.model.*;
-import org.apache.maven.model.building.DefaultModelProcessor;
-import org.apache.maven.model.building.ModelProcessor;
-import org.apache.maven.session.scope.internal.SessionScope;
-import org.codehaus.plexus.logging.Logger;
-
-import javax.enterprise.inject.Typed;
-import javax.inject.Inject;
-import javax.inject.Named;
-import javax.inject.Singleton;
-import java.io.*;
-import java.nio.file.Files;
-import java.nio.file.StandardCopyOption;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.*;
-
 import static java.lang.Boolean.parseBoolean;
 import static java.lang.Math.ceil;
 import static java.lang.Math.floor;
@@ -38,16 +9,75 @@ import static java.util.Collections.singletonList;
 import static java.util.Comparator.comparing;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
-import static me.qoomon.gitversioning.commons.GitRefType.*;
+import static me.qoomon.gitversioning.commons.GitRefType.BRANCH;
+import static me.qoomon.gitversioning.commons.GitRefType.COMMIT;
+import static me.qoomon.gitversioning.commons.GitRefType.TAG;
 import static me.qoomon.gitversioning.commons.StringUtil.substituteText;
 import static me.qoomon.gitversioning.commons.StringUtil.valueGroupMap;
 import static me.qoomon.maven.gitversioning.BuildProperties.projectArtifactId;
 import static me.qoomon.maven.gitversioning.GitVersioningMojo.GOAL;
 import static me.qoomon.maven.gitversioning.GitVersioningMojo.asPlugin;
-import static me.qoomon.maven.gitversioning.MavenUtil.*;
+import static me.qoomon.maven.gitversioning.MavenUtil.pomFile;
+import static me.qoomon.maven.gitversioning.MavenUtil.readModel;
+import static me.qoomon.maven.gitversioning.MavenUtil.readXml;
+import static me.qoomon.maven.gitversioning.MavenUtil.writeXml;
 import static org.apache.maven.shared.utils.StringUtils.leftPad;
 import static org.apache.maven.shared.utils.StringUtils.repeat;
 import static org.apache.maven.shared.utils.logging.MessageUtils.buffer;
+
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.Reader;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Properties;
+import java.util.Set;
+
+import javax.enterprise.inject.Typed;
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.inject.Singleton;
+
+import org.apache.maven.artifact.versioning.DefaultArtifactVersion;
+import org.apache.maven.building.Source;
+import org.apache.maven.execution.MavenExecutionRequest;
+import org.apache.maven.execution.MavenSession;
+import org.apache.maven.model.Build;
+import org.apache.maven.model.BuildBase;
+import org.apache.maven.model.Dependency;
+import org.apache.maven.model.DependencyManagement;
+import org.apache.maven.model.Model;
+import org.apache.maven.model.ModelBase;
+import org.apache.maven.model.Parent;
+import org.apache.maven.model.Plugin;
+import org.apache.maven.model.PluginExecution;
+import org.apache.maven.model.PluginManagement;
+import org.apache.maven.model.Profile;
+import org.apache.maven.model.building.DefaultModelProcessor;
+import org.apache.maven.model.building.ModelProcessor;
+import org.apache.maven.session.scope.internal.SessionScope;
+import org.codehaus.plexus.logging.Logger;
+
+import com.fasterxml.jackson.dataformat.xml.XmlMapper;
+import com.google.inject.Key;
+import com.google.inject.OutOfScopeException;
+
+import de.pdark.decentxml.Document;
+import de.pdark.decentxml.Element;
+import me.qoomon.gitversioning.commons.GitSituation;
+import me.qoomon.gitversioning.commons.GitUtil;
+import me.qoomon.maven.gitversioning.Configuration.PropertyDescription;
+import me.qoomon.maven.gitversioning.Configuration.VersionDescription;
 
 // TODO add option to throw an error if git has non clean state
 
@@ -78,28 +108,29 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
     @Inject
     private SessionScope sessionScope;
 
-
-    private boolean initialized = false;
+    private static final Key<GitVersioningContext> SESSION_KEY = Key.get(GitVersioningContext.class); 
+    //private boolean initialized = false;
 
     // --- following fields will be initialized by init() method -------------------------------------------------------
 
-    private MavenSession mavenSession; // can't be injected, cause it's not available before model read
-    private File mvnDirectory;
-    private GitSituation gitSituation;
+//    private MavenSession mavenSession; // can't be injected, cause it's not available before model read
+//    private File mvnDirectory;
+//    private GitSituation gitSituation;
+    private Map<File, GitVersioningContext> contextMap = new HashMap<>();
 
-    private boolean disabled = false;
-    private boolean updatePomOption = false;
-    private GitVersionDetails gitVersionDetails;
-    private Map<String, PropertyDescription> gitVersioningPropertyDescriptionMap;
-    private Map<String, String> formatPlaceholderMap;
-    private Map<String, String> gitProjectProperties;
-    private Set<GAV> relatedProjects;
+    private InheritableThreadLocal<GitVersioningContext> threadContext = new InheritableThreadLocal<>();
+    //private boolean disabled = false;
+//    private boolean updatePomOption = false;
+//    private GitVersionDetails gitVersionDetails;
+//    private Map<String, PropertyDescription> gitVersioningPropertyDescriptionMap;
+//    private Map<String, String> formatPlaceholderMap;
+//    private Map<String, String> gitProjectProperties;
+    //private Set<GAV> relatedProjects;
 
 
     // ---- other fields -----------------------------------------------------------------------------------------------
 
-    private final Set<File> projectModules = new HashSet<>();
-    private final Map<File, Model> sessionModelCache = new HashMap<>();
+    //private final Set<File> projectModules = new HashSet<>();
 
 
     @Override
@@ -120,85 +151,142 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
         return processModel(projectModel, options);
     }
 
+    private GitVersioningContext getContext(Model projectModel) {
+    	File pomFile = projectModel.getPomFile();
+		if (pomFile.getName().endsWith(".pom")) {
+    		//repo-project - use last context in order to get all dependencies right
+    		GitVersioningContext context = threadContext.get();//sessionScope.scope(SESSION_KEY, () -> null).get();
+    		if (context == null) {
+    			logger.error("context should not be null! " + projectModel);
+    			context = new GitVersioningContext();
+    			context.setDisabled(true);
+    		}
+        	threadContext.set(context);
+			return context;
+    	} else {
+    		//local project
+//    		projectModel.getPomFile();
+        	GitVersioningContext context = contextMap.get(pomFile);
+        	GitVersioningContext oldContext = context;
+//        	if (context != null) {
+        		//FIXME: reinit if git branch changed
+        		if (oldContext != null && oldContext.getGitVersionDetails() != null && context.getGitVersionDetails() != null && oldContext.getGitVersionDetails().getRefName() != null && oldContext.getGitVersionDetails().getRefName().equals(context.getGitVersionDetails().getRefName())) {
+        			//use old
+        			context = oldContext;
+        		}
+        		if (context != null) {
+        			contextMap.put(pomFile, context);
+        		}
+//        	}
+        	threadContext.set(context);
+    		//sessionScope.seed(GitVersioningContext.class, context);
+    		return context;
+    	}
+/*    	File projectDirectory = projectModel.getProjectDirectory();
+    	GitVersioningContext ctx = contextMap.get(projectDirectory);
+    	if (ctx == null) {
+    		ctx = init(projectModel);
+    		if (ctx != null) {
+    			contextMap.put(projectDirectory, ctx);
+    		}
+    	}
+    	return ctx;
+*/    	
+    }
 
-    private void init(Model projectModel) throws IOException {
-        logger.info("");
-        String extensionId = BuildProperties.projectArtifactId() + ":" + BuildProperties.projectVersion();
-        logger.info(extensionLogFormat(extensionId));
+    private GitVersioningContext init(Model projectModel) {
+    	try {
+			GitVersioningContext ctx = new GitVersioningContext();
+			logger.info("");
+			String extensionId = BuildProperties.projectArtifactId() + ":" + BuildProperties.projectVersion();
+			logger.info(extensionLogFormat(extensionId));
 
-        // check if session is available
-        try {
-            mavenSession = sessionScope.scope(Key.get(MavenSession.class), null).get();
-        } catch (OutOfScopeException ex) {
-            logger.warn("skip - no maven session present");
-            disabled = true;
-            return;
-        }
+			// check if session is available
+			try {
+			    ctx.setMavenSession(sessionScope.scope(Key.get(MavenSession.class), null).get());
+			} catch (OutOfScopeException ex) {
+			    logger.warn("skip - no maven session present");
+			    ctx.setDisabled(true);
+			    return ctx;
+			}
 
-        File executionRootDirectory = new File(mavenSession.getRequest().getBaseDirectory());
-        logger.debug("execution root directory: " + executionRootDirectory);
+			MavenExecutionRequest request = ctx.getMavenSession().getRequest();
+			if (request.getBaseDirectory() == null) {
+				//File from local repo
+			    ctx.setDisabled(true);
+				return ctx;
+			}
+			File executionRootDirectory = new File(request.getBaseDirectory());
+			logger.debug("execution root directory: " + executionRootDirectory);
 
-        mvnDirectory = findMvnDirectory(executionRootDirectory);
-        logger.debug(".mvn directory: " + mvnDirectory);
+			ctx.setMvnDirectory(executionRootDirectory);
+			logger.debug(".mvn directory: " + ctx.getMvnDirectory());
 
-        File configFile = new File(mvnDirectory, projectArtifactId() + ".xml");
-        logger.debug("read config from " + configFile);
-        Configuration config = readConfig(configFile);
+			File configFile = new File(ctx.getMvnDirectory(), projectArtifactId() + ".xml");
+			if (!configFile.exists()) {	//FIXME: alternate location
+				ctx.setDisabled(true);
+				return ctx;
+			} 
+			logger.debug("read config from " + configFile);
+			Configuration config = readConfig(configFile);
 
-        // check if extension is disabled by command option
-        String commandOptionDisable = getCommandOption(OPTION_NAME_DISABLE);
-        if (commandOptionDisable != null) {
-            disabled = parseBoolean(commandOptionDisable);
-            if (disabled) {
-                logger.info("skip - versioning is disabled by command option");
-                return;
-            }
-        } else {
-            // check if extension is disabled by config option
-            disabled = config.disable != null && config.disable;
-            if (disabled) {
-                logger.info("skip - versioning is disabled by config option");
-                return;
-            }
-        }
+			// check if extension is disabled by command option
+			String commandOptionDisable = getCommandOption(ctx.getMavenSession(), OPTION_NAME_DISABLE);
+			if (commandOptionDisable != null) {
+				ctx.setDisabled(parseBoolean(commandOptionDisable));
+			    if (ctx.isDisabled()) {
+			        logger.info("skip - versioning is disabled by command option");
+			        return ctx;
+			    }
+			} else {
+			    // check if extension is disabled by config option
+				ctx.setDisabled(config.disable != null && config.disable);
+			    if (ctx.isDisabled()) {
+			        logger.info("skip - versioning is disabled by config option");
+			        return ctx;
+			    }
+			}
+			ctx.setGitSituation(getGitSituation(ctx.getMavenSession(), executionRootDirectory));
+			if (ctx.getGitSituation() == null) {
+			    logger.warn("skip - project is not part of a git repository");
+			    ctx.setDisabled(true);
+			    return ctx;
+			}
+			logger.debug("git situation: " + ctx.getGitSituation().getRootDirectory());
+			logger.debug("  root directory: " + ctx.getGitSituation().getRootDirectory());
+			logger.debug("  head commit: " + ctx.getGitSituation().getHeadCommit());
+			logger.debug("  head commit timestamp: " + ctx.getGitSituation().getHeadCommitTimestamp());
+			logger.debug("  head branch: " + ctx.getGitSituation().getHeadBranch());
+			logger.debug("  head tags: " + ctx.getGitSituation().getHeadTags());
 
-        gitSituation = getGitSituation(executionRootDirectory);
-        if (gitSituation == null) {
-            logger.warn("skip - project is not part of a git repository");
-            disabled = true;
-            return;
-        }
-        logger.debug("git situation: " + gitSituation.getRootDirectory());
-        logger.debug("  root directory: " + gitSituation.getRootDirectory());
-        logger.debug("  head commit: " + gitSituation.getHeadCommit());
-        logger.debug("  head commit timestamp: " + gitSituation.getHeadCommitTimestamp());
-        logger.debug("  head branch: " + gitSituation.getHeadBranch());
-        logger.debug("  head tags: " + gitSituation.getHeadTags());
+			boolean preferTagsOption = getPreferTagsOption(ctx.getMavenSession(),config);
+			logger.debug("option -  prefer tags: " + preferTagsOption);
 
-        boolean preferTagsOption = getPreferTagsOption(config);
-        logger.debug("option -  prefer tags: " + preferTagsOption);
+			// determine git version details
+			ctx.setGitVersionDetails(getGitVersionDetails(ctx.getGitSituation(), config, preferTagsOption));
+			logger.info("git " + ctx.getGitVersionDetails().getRefType().name().toLowerCase() + ": " + buffer().strong(ctx.getGitVersionDetails().getRefName()));
+			ctx.setGitVersioningPropertyDescriptionMap(ctx.getGitVersionDetails().getConfig().property.stream()
+			        .collect(toMap(property -> property.name, property -> property)));
 
-        // determine git version details
-        gitVersionDetails = getGitVersionDetails(gitSituation, config, preferTagsOption);
-        logger.info("git " + gitVersionDetails.getRefType().name().toLowerCase() + ": " + buffer().strong(gitVersionDetails.getRefName()));
-        gitVersioningPropertyDescriptionMap = gitVersionDetails.getConfig().property.stream()
-                .collect(toMap(property -> property.name, property -> property));
+			ctx.setUpdatePomOption(getUpdatePomOption(ctx.getMavenSession(), config, ctx.getGitVersionDetails().getConfig()));
+			logger.debug("option - update pom: " + ctx.isUpdatePomOption());
 
-        updatePomOption = getUpdatePomOption(config, gitVersionDetails.getConfig());
-        logger.debug("option - update pom: " + updatePomOption);
+			// determine related projects
+			ctx.setRelatedProjects(determineRelatedProjects(ctx, projectModel));
+			logger.debug("related projects:");
+			ctx.getRelatedProjects().forEach(gav -> logger.debug("  " + gav));
 
-        // determine related projects
-        relatedProjects = determineRelatedProjects(projectModel);
-        logger.debug("related projects:");
-        relatedProjects.forEach(gav -> logger.debug("  " + gav));
+			// add session root project as initial module
+			ctx.getProjectModules().add(projectModel.getPomFile());
 
-        // add session root project as initial module
-        projectModules.add(projectModel.getPomFile());
+			ctx.setFormatPlaceholderMap(generateFormatPlaceholderMapFromGit(ctx.getGitSituation(), ctx.getGitVersionDetails()));
+			ctx.setGitProjectProperties(generateGitProjectProperties(ctx.getGitSituation(), ctx.getGitVersionDetails()));
 
-        formatPlaceholderMap = generateFormatPlaceholderMapFromGit(gitSituation, gitVersionDetails);
-        gitProjectProperties = generateGitProjectProperties(gitSituation, gitVersionDetails);
-
-        logger.info("");
+			logger.info("");
+			return ctx;
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
     }
 
     // ---- model processing -------------------------------------------------------------------------------------------
@@ -212,13 +300,14 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
             logger.debug("skip model - no project model pom file");
             return projectModel;
         }
+        GitVersioningContext context = getContext(projectModel);
+//        if (!initialized) {
+//            init(projectModel);
+//            initialized = true;
+//        }
+        
 
-        if (!initialized) {
-            init(projectModel);
-            initialized = true;
-        }
-
-        if (disabled) {
+        if (context.isDisabled()) {
             return projectModel;
         }
 
@@ -234,29 +323,29 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
 
         File canonicalProjectPomFile = projectModel.getPomFile().getCanonicalFile();
 
-        if (!projectModules.contains(canonicalProjectPomFile)) {
+        if (!context.getProjectModules().contains(canonicalProjectPomFile)) {
             logger.debug("skip model - non project module - " + projectModel.getPomFile());
             return projectModel;
         }
 
         // return cached calculated project model if present
-        Model cachedProjectModel = sessionModelCache.get(canonicalProjectPomFile);
+        Model cachedProjectModel = context.getSessionModelCache().get(canonicalProjectPomFile);
         if (cachedProjectModel != null) {
             return cachedProjectModel;
         }
 
         // add current project model to session project models
-        sessionModelCache.put(canonicalProjectPomFile, projectModel);
+        context.getSessionModelCache().put(canonicalProjectPomFile, projectModel);
 
         // log project header
         logger.info(buffer().strong("--- ") + buffer().project(GAV.of(projectModel)).toString() + buffer().strong(" ---"));
 
-        updateModel(projectModel);
+        updateModel(context, projectModel);
 
-        addGitProperties(projectModel);
+        addGitProperties(context, projectModel);
 
-        File gitVersionedPomFile = writePomFile(projectModel);
-        if (updatePomOption) {
+        File gitVersionedPomFile = writePomFile(context, projectModel);
+        if (context.isUpdatePomOption()) {
             logger.debug("updating original POM file");
             Files.copy(
                     gitVersionedPomFile.toPath(),
@@ -272,63 +361,63 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
 
         // add potential project modules
         for (File modulePomFile : getProjectModules(projectModel)) {
-            projectModules.add(modulePomFile.getCanonicalFile());
+        	context.getProjectModules().add(modulePomFile.getCanonicalFile());
         }
 
         logger.info("");
         return projectModel;
     }
 
-    private void updateModel(Model projectModel) {
+    private void updateModel(GitVersioningContext context, Model projectModel) {
         GAV originalProjectGAV = GAV.of(projectModel);
-
-        updateVersion(projectModel.getParent());
-        updateVersion(projectModel);
-        updatePropertyValues(projectModel, originalProjectGAV);
-        updateDependencyVersions(projectModel);
-        updatePluginVersions(projectModel.getBuild());
+        
+        updateVersion(context, projectModel.getParent());
+        updateVersion(context, projectModel);
+        updatePropertyValues(context, projectModel, originalProjectGAV);
+        updateDependencyVersions(context, projectModel);
+        updatePluginVersions(context, projectModel.getBuild());
 
         // profile section
-        updateProfiles(projectModel.getProfiles(), originalProjectGAV);
+        updateProfiles(context, projectModel.getProfiles(), originalProjectGAV);
     }
 
-    private void updateProfiles(List<Profile> profiles, GAV originalProjectGAV) {
+    private void updateProfiles(GitVersioningContext context, List<Profile> profiles, GAV originalProjectGAV) {
         // profile section
         if (!profiles.isEmpty()) {
             logger.info("profiles:");
             for (Profile profile : profiles) {
                 logger.info("profile: " + profile.getId());
-                updatePropertyValues(profile, originalProjectGAV);
-                updateDependencyVersions(profile);
-                updatePluginVersions(profile.getBuild());
+                updatePropertyValues(context, profile, originalProjectGAV);
+                updateDependencyVersions(context, profile);
+                updatePluginVersions(context, profile.getBuild());
             }
         }
     }
 
-    private void updateVersion(Parent parent) {
+    private void updateVersion(GitVersioningContext context, Parent parent) {
         if (parent != null) {
             GAV parentGAV = GAV.of(parent);
-            if (relatedProjects.contains(parentGAV)) {
-                String gitVersion = getGitVersion(parentGAV);
+            if (context.getRelatedProjects().contains(parentGAV)) {
+                String gitVersion = getGitVersion(context, parentGAV);
                 logger.debug("update parent version: " + parentGAV.getProjectId() + ":" + gitVersion);
-                parent.setVersion(getGitVersion(parentGAV));
+                parent.setVersion(getGitVersion(context, parentGAV));
             }
         }
     }
 
-    private void updateVersion(Model projectModel) {
+    private void updateVersion(GitVersioningContext context, Model projectModel) {
         if (projectModel.getVersion() != null) {
             GAV projectGAV = GAV.of(projectModel);
-            String gitVersion = getGitVersion(projectGAV);
+            String gitVersion = getGitVersion(context, projectGAV);
             logger.info("update version: " + gitVersion);
             projectModel.setVersion(gitVersion);
         }
     }
 
-    private void updatePropertyValues(ModelBase model, GAV originalProjectGAV) {
+    private void updatePropertyValues(GitVersioningContext context, ModelBase model, GAV originalProjectGAV) {
         // properties section
         model.getProperties().forEach((key, value) -> {
-            String gitPropertyValue = getGitProjectPropertyValue((String) key, (String) value, originalProjectGAV);
+            String gitPropertyValue = getGitProjectPropertyValue(context, (String) key, (String) value, originalProjectGAV);
             if (!gitPropertyValue.equals(value)) {
                 logger.info("update property " + key + ": " + gitPropertyValue);
                 model.addProperty((String) key, gitPropertyValue);
@@ -336,17 +425,17 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
         });
     }
 
-    private void updatePluginVersions(BuildBase build) {
+    private void updatePluginVersions(GitVersioningContext context, BuildBase build) {
         if (build == null) {
             return;
         }
         // plugins section
         {
-            List<Plugin> relatedPlugins = filterRelatedPlugins(build.getPlugins());
+            List<Plugin> relatedPlugins = filterRelatedPlugins(context, build.getPlugins());
             if (!relatedPlugins.isEmpty()) {
                 logger.debug("plugins:");
                 for (Plugin plugin : relatedPlugins) {
-                    updateVersion(plugin);
+                    updateVersion(context, plugin);
                 }
             }
         }
@@ -354,72 +443,72 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
         // plugin management section
         PluginManagement pluginManagement = build.getPluginManagement();
         if (pluginManagement != null) {
-            List<Plugin> relatedPlugins = filterRelatedPlugins(pluginManagement.getPlugins());
+            List<Plugin> relatedPlugins = filterRelatedPlugins(context, pluginManagement.getPlugins());
             if (!relatedPlugins.isEmpty()) {
                 logger.debug("plugin management:");
                 for (Plugin plugin : relatedPlugins) {
-                    updateVersion(plugin);
+                    updateVersion(context, plugin);
                 }
             }
         }
     }
 
-    private void updateVersion(Plugin plugin) {
+    private void updateVersion(GitVersioningContext context, Plugin plugin) {
         if (plugin.getVersion() != null) {
             GAV pluginGAV = GAV.of(plugin);
-            String gitVersion = getGitVersion(pluginGAV);
+            String gitVersion = getGitVersion(context, pluginGAV);
             logger.debug("update plugin version: " + pluginGAV.getProjectId() + ":" + gitVersion);
             plugin.setVersion(gitVersion);
         }
     }
 
-    public List<Plugin> filterRelatedPlugins(List<Plugin> plugins) {
+    public List<Plugin> filterRelatedPlugins(GitVersioningContext context, List<Plugin> plugins) {
         return plugins.stream()
-                .filter(it -> relatedProjects.contains(GAV.of(it)))
+                .filter(it -> context.getRelatedProjects().contains(GAV.of(it)))
                 .collect(toList());
     }
 
-    private void updateDependencyVersions(ModelBase model) {
+    private void updateDependencyVersions(GitVersioningContext context, ModelBase model) {
         // dependencies section
         {
-            List<Dependency> relatedDependencies = filterRelatedDependencies(model.getDependencies());
+            List<Dependency> relatedDependencies = filterRelatedDependencies(context, model.getDependencies());
             if (!relatedDependencies.isEmpty()) {
                 logger.debug("dependencies:");
                 for (Dependency dependency : relatedDependencies) {
-                    updateVersion(dependency);
+                    updateVersion(context, dependency);
                 }
             }
         }
         // dependency management section
         DependencyManagement dependencyManagement = model.getDependencyManagement();
         if (dependencyManagement != null) {
-            List<Dependency> relatedDependencies = filterRelatedDependencies(dependencyManagement.getDependencies());
+            List<Dependency> relatedDependencies = filterRelatedDependencies(context, dependencyManagement.getDependencies());
             if (!relatedDependencies.isEmpty()) {
                 logger.debug("dependency management:");
                 for (Dependency dependency : relatedDependencies) {
-                    updateVersion(dependency);
+                    updateVersion(context, dependency);
                 }
             }
         }
     }
 
-    private void updateVersion(Dependency dependency) {
+    private void updateVersion(GitVersioningContext context, Dependency dependency) {
         if (dependency.getVersion() != null) {
             GAV dependencyGAV = GAV.of(dependency);
-            String gitVersion = getGitVersion(dependencyGAV);
+            String gitVersion = getGitVersion(context, dependencyGAV);
             logger.debug("update dependency version: " + dependencyGAV.getProjectId() + ":" + gitVersion);
             dependency.setVersion(gitVersion);
         }
     }
 
-    public List<Dependency> filterRelatedDependencies(List<Dependency> dependencies) {
+    public List<Dependency> filterRelatedDependencies(GitVersioningContext context, List<Dependency> dependencies) {
         return dependencies.stream()
-                .filter(it -> relatedProjects.contains(GAV.of(it)))
+                .filter(it -> context.getRelatedProjects().contains(GAV.of(it)))
                 .collect(toList());
     }
 
-    private void addGitProperties(Model projectModel) {
-        gitProjectProperties.forEach(projectModel::addProperty);
+    private void addGitProperties(GitVersioningContext context, Model projectModel) {
+    	context.getGitProjectProperties().forEach(projectModel::addProperty);
     }
 
     private void addBuildPlugin(Model projectModel) {
@@ -441,12 +530,12 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
 
     // ---- versioning -------------------------------------------------------------------------------------------------
 
-    private GitSituation getGitSituation(File executionRootDirectory) throws IOException {
+    private GitSituation getGitSituation(MavenSession mavenSession, File executionRootDirectory) throws IOException {
         GitSituation gitSituation = GitUtil.situation(executionRootDirectory);
         if (gitSituation == null) {
             return null;
         }
-        String providedTag = getCommandOption(OPTION_NAME_GIT_TAG);
+        String providedTag = getCommandOption(mavenSession, OPTION_NAME_GIT_TAG);
         if (providedTag != null) {
             logger.debug("set git head tag by command option: " + providedTag);
             gitSituation = GitSituation.Builder.of(gitSituation)
@@ -454,7 +543,7 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
                     .setHeadTags(providedTag.isEmpty() ? emptyList() : singletonList(providedTag))
                     .build();
         }
-        String providedBranch = getCommandOption(OPTION_NAME_GIT_BRANCH);
+        String providedBranch = getCommandOption(mavenSession, OPTION_NAME_GIT_BRANCH);
         if (providedBranch != null) {
             logger.debug("set git head branch by command option: " + providedBranch);
             gitSituation = GitSituation.Builder.of(gitSituation)
@@ -512,28 +601,28 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
         }
     }
 
-    private String getGitVersion(GAV originalProjectGAV) {
-        final Map<String, String> placeholderMap = generateFormatPlaceholderMap(originalProjectGAV);
-        return substituteText(gitVersionDetails.getConfig().versionFormat, placeholderMap)
+    private String getGitVersion(GitVersioningContext context, GAV originalProjectGAV) {
+        final Map<String, String> placeholderMap = generateFormatPlaceholderMap(context, originalProjectGAV);
+        return substituteText(context.getGitVersionDetails().getConfig().versionFormat, placeholderMap)
                 // replace invalid version characters
                 .replace("/", "-");
     }
 
-    private String getGitProjectPropertyValue(String key, String originalValue, GAV originalProjectGAV) {
-        PropertyDescription propertyConfig = gitVersioningPropertyDescriptionMap.get(key);
+    private String getGitProjectPropertyValue(GitVersioningContext context, String key, String originalValue, GAV originalProjectGAV) {
+        PropertyDescription propertyConfig = context.getGitVersioningPropertyDescriptionMap().get(key);
         if (propertyConfig == null) {
             return originalValue;
         }
-        final Map<String, String> placeholderMap = generateFormatPlaceholderMap(originalProjectGAV);
+        final Map<String, String> placeholderMap = generateFormatPlaceholderMap(context, originalProjectGAV);
         placeholderMap.put("value", originalValue);
         return substituteText(propertyConfig.valueFormat, placeholderMap);
     }
 
-    private Map<String, String> generateFormatPlaceholderMap(GAV originalProjectGAV) {
+    private Map<String, String> generateFormatPlaceholderMap(GitVersioningContext context, GAV originalProjectGAV) {
         final Map<String, String> placeholderMap = new HashMap<>();
-        placeholderMap.putAll(formatPlaceholderMap);
+        placeholderMap.putAll(context.getFormatPlaceholderMap());
         placeholderMap.putAll(generateFormatPlaceholderMapFromVersion(originalProjectGAV));
-        mavenSession.getUserProperties().forEach((key, value) -> placeholderMap.put((String) key, (String) value));
+        context.getMavenSession().getUserProperties().forEach((key, value) -> placeholderMap.put((String) key, (String) value));
         return placeholderMap;
     }
 
@@ -645,7 +734,7 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
         return config;
     }
 
-    private String getCommandOption(final String name) {
+    private String getCommandOption(MavenSession mavenSession, final String name) {
         String value = mavenSession.getUserProperties().getProperty(name);
         if (value == null) {
             String plainName = name.replaceFirst("^versioning\\.", "");
@@ -661,8 +750,8 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
         return value;
     }
 
-    private boolean getPreferTagsOption(final Configuration config) {
-        final String preferTagsCommandOption = getCommandOption(OPTION_PREFER_TAGS);
+    private boolean getPreferTagsOption(MavenSession mavenSession, final Configuration config) {
+        final String preferTagsCommandOption = getCommandOption(mavenSession, OPTION_PREFER_TAGS);
         if (preferTagsCommandOption != null) {
             return parseBoolean(preferTagsCommandOption);
         }
@@ -674,8 +763,8 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
         return false;
     }
 
-    private boolean getUpdatePomOption(final Configuration config, final VersionDescription gitRefConfig) {
-        final String updatePomCommandOption = getCommandOption(OPTION_UPDATE_POM);
+    private boolean getUpdatePomOption(MavenSession mavenSession, final Configuration config, final VersionDescription gitRefConfig) {
+        final String updatePomCommandOption = getCommandOption(mavenSession, OPTION_UPDATE_POM);
         if (updatePomCommandOption != null) {
             return parseBoolean(updatePomCommandOption);
         }
@@ -694,13 +783,13 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
 
     // ---- determine related projects ---------------------------------------------------------------------------------
 
-    private Set<GAV> determineRelatedProjects(Model projectModel) throws IOException {
+    private Set<GAV> determineRelatedProjects(GitVersioningContext context, Model projectModel) throws IOException {
         HashSet<GAV> relatedProjects = new HashSet<>();
-        determineRelatedProjects(projectModel, relatedProjects);
+        determineRelatedProjects(context, projectModel, relatedProjects);
         return relatedProjects;
     }
 
-    private void determineRelatedProjects(Model projectModel, Set<GAV> relatedProjects) throws IOException {
+    private void determineRelatedProjects(GitVersioningContext context, Model projectModel, Set<GAV> relatedProjects) throws IOException {
         GAV projectGAV = GAV.of(projectModel);
         if (relatedProjects.contains(projectGAV)) {
             return;
@@ -713,25 +802,28 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
         if (projectModel.getParent() != null) {
             GAV parentGAV = GAV.of(projectModel.getParent());
             File parentProjectPomFile = getParentProjectPomFile(projectModel);
-            if (isRelatedPom(parentProjectPomFile)) {
+        	
+        	if (isRelatedPom(context, parentProjectPomFile)) {
                 Model parentProjectModel = readModel(parentProjectPomFile);
                 GAV parentProjectGAV = GAV.of(parentProjectModel);
                 if (parentProjectGAV.equals(parentGAV)) {
-                    determineRelatedProjects(parentProjectModel, relatedProjects);
+                    determineRelatedProjects(context, parentProjectModel, relatedProjects);
                 }
             }
         }
 
         // check for related parent project within parent directory
-        Model parentProjectModel = searchParentProjectInParentDirectory(projectModel);
+        Model parentProjectModel = searchParentProjectInParentDirectory(context, projectModel);
         if (parentProjectModel != null) {
-            determineRelatedProjects(parentProjectModel, relatedProjects);
+            determineRelatedProjects(context, parentProjectModel, relatedProjects);
         }
 
         //  process modules
         for (File modulePomFile : getProjectModules(projectModel)) {
-            Model moduleProjectModel = readModel(modulePomFile);
-            determineRelatedProjects(moduleProjectModel, relatedProjects);
+            if (modulePomFile.exists()) {
+	        	Model moduleProjectModel = readModel(modulePomFile);
+	            determineRelatedProjects(context, moduleProjectModel, relatedProjects);
+            }
         }
     }
 
@@ -741,21 +833,21 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
      * @param pomFile the pom file
      * @return true if <code>pomFile</code> is part of current maven and git context
      */
-    private boolean isRelatedPom(File pomFile) throws IOException {
+    private boolean isRelatedPom(GitVersioningContext context, File pomFile) throws IOException {
         return pomFile != null
                 && pomFile.exists()
                 && pomFile.isFile()
                 // only project pom files ends in .xml, pom files from dependencies from repositories ends in .pom
                 && pomFile.getName().endsWith(".xml")
-                && pomFile.getCanonicalPath().startsWith(mvnDirectory.getParentFile().getCanonicalPath() + File.separator)
+                && pomFile.getCanonicalPath().startsWith(context.getMvnDirectory().getParentFile().getCanonicalPath() + File.separator)
                 // only pom files within git directory are treated as project pom files
-                && pomFile.getCanonicalPath().startsWith(gitSituation.getRootDirectory().getCanonicalPath() + File.separator);
+                && pomFile.getCanonicalPath().startsWith(context.getGitSituation().getRootDirectory().getCanonicalPath() + File.separator);
     }
 
-    private Model searchParentProjectInParentDirectory(Model projectModel) throws IOException {
+    private Model searchParentProjectInParentDirectory(GitVersioningContext context, Model projectModel) throws IOException {
         // search for parent project by directory hierarchy
         File parentDirectoryPomFile = pomFile(projectModel.getProjectDirectory().getParentFile(), "pom.xml");
-        if (parentDirectoryPomFile.exists() && isRelatedPom(parentDirectoryPomFile)) {
+        if (parentDirectoryPomFile.exists() && isRelatedPom(context, parentDirectoryPomFile)) {
             // check if parent has module that points to current project directory
             Model parentDirectoryProjectModel = readModel(parentDirectoryPomFile);
             for (File modulePomFile : getProjectModules(parentDirectoryProjectModel)) {
@@ -803,7 +895,7 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
 
     // ---- generate git versioned pom file ----------------------------------------------------------------------------
 
-    private File writePomFile(Model projectModel) throws IOException {
+    private File writePomFile(GitVersioningContext context, Model projectModel) throws IOException {
         File gitVersionedPomFile = new File(projectModel.getProjectDirectory(), GIT_VERSIONING_POM_NAME);
         logger.debug("generate " + gitVersionedPomFile);
 
@@ -814,11 +906,11 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
         // update project
         updateParentVersion(projectElement, projectModel.getParent());
         updateVersion(projectElement, projectModel);
-        updatePropertyValues(projectElement, projectModel);
+        updatePropertyValues(context, projectElement, projectModel);
         updateDependencyVersions(projectElement, projectModel);
         updatePluginVersions(projectElement, projectModel.getBuild());
 
-        updateProfiles(projectElement, projectModel.getProfiles());
+        updateProfiles(context, projectElement, projectModel.getProfiles());
 
         writeXml(gitVersionedPomFile, gitVersionedPomDocument);
 
@@ -840,12 +932,12 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
         }
     }
 
-    private void updatePropertyValues(Element element, ModelBase model) {
+    private void updatePropertyValues(GitVersioningContext context, Element element, ModelBase model) {
         // properties section
         Element propertiesElement = element.getChild("properties");
         if (propertiesElement != null) {
             Properties modelProperties = model.getProperties();
-            gitVersionDetails.getConfig().property.forEach(property -> {
+            context.getGitVersionDetails().getConfig().property.forEach(property -> {
                 String propertyName = property.name;
                 Element propertyElement = propertiesElement.getChild(propertyName);
                 if (propertyElement != null) {
@@ -932,14 +1024,14 @@ public class GitVersioningModelProcessor extends DefaultModelProcessor {
         }
     }
 
-    private void updateProfiles(Element projectElement, List<Profile> profiles) {
+    private void updateProfiles(GitVersioningContext context, Element projectElement, List<Profile> profiles) {
         Element profilesElement = projectElement.getChild("profiles");
         if (profilesElement != null) {
             Map<String, Profile> profileMap = profiles.stream()
                     .collect(toMap(Profile::getId, it -> it));
             for (Element profileElement : profilesElement.getChildren("profile")) {
                 Profile profile = profileMap.get(profileElement.getChild("id").getText());
-                updatePropertyValues(profileElement, profile);
+                updatePropertyValues(context, profileElement, profile);
                 updateDependencyVersions(profileElement, profile);
                 updatePluginVersions(profileElement, profile.getBuild());
             }
